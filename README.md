@@ -78,3 +78,26 @@ py -m unittest
 ## License
 
 Provided as-is for educational purposes. Review Google AI Studio terms before using the Gemini API in production.
+
+## ESP32 BLE integration
+
+This repository includes two Arduino/ESP32 sketches under `esp32_stuff/`:
+
+- `MainSystem.ino` — a small BLE GATT server that advertises as `MainSystem` and exposes a writable characteristic. It prints any received alert payloads to Serial.
+- `camera/CameraWebServer/CameraWebServer.ino` — the camera + Gemini integration. When a rat is detected it attempts to connect to `MainSystem` over BLE and write a small JSON alert to the characteristic.
+
+How to use:
+
+1. Flash `MainSystem.ino` to the ESP32 you want to act as the receiver. Open Serial Monitor at 115200 to see incoming alerts. The device advertises as `MainSystem`.
+2. Flash `CameraWebServer.ino` to the camera ESP32 and configure WiFi and Gemini settings as before.
+3. When the camera detects a rat it will scan for `MainSystem` and write a JSON payload like `{"rat_detected":true,"confidence":0.92,"notes":"..."}` to the server. The server prints the payload to Serial.
+
+Notes and caveats:
+
+- BLE scanning/writing is best-effort and may fail if the devices are out of range or busy. The camera implements a short scan and single write attempt; you can increase the scan time if needed.
+- UUIDs used in both sketches are defined in the code; change them in both files if you want custom values.
+- On some ESP32 boards the BLE and WiFi coexistence can impact performance. If you see instability, try lowering WiFi transmit power or tweaking BLE scan parameters.
+
+Optional: disabling the built-in camera webserver to reduce firmware size
+---------------------------------------------------------------
+The camera sketch includes the standard ESP32 camera webserver which increases flash/IRAM usage. If you experience IRAM overflow during linking, you can disable the webserver by not defining `ENABLE_CAMERA_WEBSERVER` before building (it's disabled by default in this repo). To enable the webserver, add `#define ENABLE_CAMERA_WEBSERVER` at the top of `CameraWebServer.ino` or add it as a build flag in your PlatformIO/Arduino build configuration.

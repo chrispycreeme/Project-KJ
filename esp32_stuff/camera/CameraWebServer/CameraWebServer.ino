@@ -4,6 +4,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>  // Install ArduinoJson (6.x) via Library Manager
 #include "mbedtls/base64.h"
+// BLE client to send alerts to MainSystem
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 // ===========================
 // Select camera model in board_config.h
@@ -263,10 +267,33 @@ bool captureAndDetectRats() {
     const char *notes = analysis["notes"].as<const char *>();
 
     Serial.println("[Detection] Parsed result");
-    Serial.printf("  rat_detected: %s\n", ratDetected ? "true" : "false");
-    Serial.printf("  confidence: %.2f\n", confidence);
+    Serial.print("  rat_detected: ");
+    Serial.println(ratDetected ? "true" : "false");
+    Serial.print("  confidence: ");
+    Serial.println(String(confidence, 2));
     if (notes) {
-      Serial.printf("  notes: %s\n", notes);
+      Serial.print("  notes: ");
+      Serial.println(notes);
+    }
+    // If rat detected, send BLE alert to MainSystem
+    if (ratDetected) {
+      // Build a small JSON payload
+      String payload = "{";
+      payload += "\"rat_detected\":true,";
+      payload += "\"confidence\":" + String(confidence, 2) + ",";
+      payload += "\"notes\":\"" + String(notes ? notes : "") + "\"";
+      payload += "}";
+
+      Serial.println("[BLE] Sending alert to MainSystem: "+ payload);
+      // Attempt to send alert (best-effort)
+      bool sent = false;
+      // Wrap in try/catch style minimal timeout
+      sent = connectAndSendAlert(payload);
+      if (sent) {
+        Serial.println("[BLE] Alert sent successfully");
+      } else {
+        Serial.println("[BLE] Alert failed or MainSystem not reachable");
+      }
     }
   } else {
     Serial.println("[Detection] Unable to parse reply as JSON");
@@ -275,12 +302,93 @@ bool captureAndDetectRats() {
   return true;
 }
 
+// ---------- BLE client helpers ----------
+// UUIDs must match MainSystem.ino
+static BLEUUID serviceUUID("12345678-1234-1234-1234-1234567890ab");
+static BLEUUID charUUID("abcd1234-5678-90ab-cdef-1234567890ab");
+
+bool connectAndSendAlert(const String &payload) {
+  // Initialize BLE if needed
+  if (!BLEDevice::getInitialized()) {
+    BLEDevice::init("CameraClient");
+  }
+
+  BLEScan *pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  const int scanTimeSec = 3;
+  Serial.println("[BLE] Scanning for MainSystem...");
+  // Note: depending on ESP32 Arduino core version, start() may return a pointer
+  // to BLEScanResults. Handle pointer return to be compatible.
+  BLEScanResults *results = pBLEScan->start(scanTimeSec, false);
+
+  for (int i = 0; i < results->getCount(); ++i) {
+    BLEAdvertisedDevice adv = results->getDevice(i);
+    // Match by advertised name or service UUID
+    if (adv.haveName() && adv.getName() == "MainSystem") {
+      Serial.println("[BLE] Found device by name: " + adv.getName());
+    } else if (adv.haveServiceUUID() && adv.isAdvertisingService(serviceUUID)) {
+      Serial.println("[BLE] Found device advertising target service");
+    } else {
+      continue;
+    }
+
+    // Try to connect
+    BLEAddress addr = adv.getAddress();
+    Serial.print("[BLE] Connecting to ");
+    Serial.println(addr.toString().c_str());
+    BLERemoteCharacteristic *pRemoteChar = nullptr;
+    BLEClient *pClient = BLEDevice::createClient();
+    if (!pClient->connect(addr)) {
+      Serial.println("[BLE] Failed to connect");
+      pClient->disconnect();
+      delete pClient;
+      continue;
+    }
+
+    BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService == nullptr) {
+      Serial.println("[BLE] Service not found on device");
+      pClient->disconnect();
+      delete pClient;
+      continue;
+    }
+
+    pRemoteChar = pRemoteService->getCharacteristic(charUUID);
+    if (pRemoteChar == nullptr) {
+      Serial.println("[BLE] Characteristic not found");
+      pClient->disconnect();
+      delete pClient;
+      continue;
+    }
+
+    // Write payload as bytes without std::string
+    const char *dataPtr = payload.c_str();
+    size_t dataLen = payload.length();
+    bool ok = false;
+    if (dataLen > 0) {
+      pRemoteChar->writeValue((uint8_t *)dataPtr, dataLen, false);
+      ok = true;
+    }
+
+    pClient->disconnect();
+    delete pClient;
+    if (ok) return true;
+  }
+
+  Serial.println("[BLE] Scan complete, no suitable device/failed to send");
+  return false;
+}
+
 void startCameraServer();
 void setupLedFlash();
 
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
+  // Disable verbose core debug output to reduce flash/iram footprint
+  // Serial.setDebugOutput(true);
   Serial.println();
 
   gHasPsram = psramFound();
@@ -423,7 +531,13 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
 
+  // The full camera webserver is optional (large). Define ENABLE_CAMERA_WEBSERVER
+  // if you want the HTTP streaming server. Leaving it off reduces IRAM usage.
+#ifdef ENABLE_CAMERA_WEBSERVER
   startCameraServer();
+#else
+  Serial.println("Camera webserver disabled (define ENABLE_CAMERA_WEBSERVER to enable)");
+#endif
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());

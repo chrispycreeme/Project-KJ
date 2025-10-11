@@ -21,6 +21,8 @@
 #include "camera_index.h"
 #include "board_config.h"
 
+#ifdef ENABLE_CAMERA_WEBSERVER
+
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
@@ -69,6 +71,8 @@ static ra_filter_t *ra_filter_init(ra_filter_t *filter, size_t sample_size) {
   filter->size = sample_size;
   return filter;
 }
+
+#endif // ENABLE_CAMERA_WEBSERVER
 
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
 static int ra_filter_run(ra_filter_t *filter, int value) {
