@@ -4,10 +4,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>  // Install ArduinoJson (6.x) via Library Manager
 #include "mbedtls/base64.h"
-// BLE client to send alerts to MainSystem
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+// Enable the built-in camera webserver. This adds code size but provides
+// the HTTP streaming endpoints. Define this only if you need the web UI.
+#define ENABLE_CAMERA_WEBSERVER
 
 // ===========================
 // Select camera model in board_config.h
@@ -46,14 +45,17 @@ const bool CAMERA_ENABLE_AUTO_WHITE_BALANCE = true;         // Maintain auto whi
 const bool CAMERA_ENABLE_AWB_GAIN = true;                   // Allow gain adjustments for white balance
 const bool CAMERA_ENABLE_LENS_CORRECTION = true;            // Helps edge softness when gain is high
 const int CAMERA_MANUAL_EXPOSURE = 0;                       // 0 keeps auto; otherwise 0-1200 manual exposure
-const int CAMERA_WARMUP_FRAMES = 1;                         // Extra frames to discard before detection
+const int CAMERA_WARMUP_FRAMES = 3;                         // Extra frames to discard before detection
 const int CAMERA_WARMUP_DELAY_MS = 60;                      // Delay between warmup frames (ms)
 
 // Common frame size options: FRAMESIZE_QQVGA (160x120), FRAMESIZE_QVGA (320x240),
 // FRAMESIZE_VGA (640x480), FRAMESIZE_SVGA (800x600), FRAMESIZE_XGA (1024x768),
 // FRAMESIZE_HD (1280x720), FRAMESIZE_UXGA (1600x1200), FRAMESIZE_FHD (1920x1080)
 const framesize_t CAMERA_INIT_FRAME_SIZE = FRAMESIZE_UXGA;          // Resolution during sensor init
-const framesize_t CAMERA_RUNTIME_FRAME_SIZE = FRAMESIZE_XGA;       // Resolution used after tuning
+// Prefer HD (1280x720) runtime frame size for a good balance of quality and
+// network size. If PSRAM is present, we use HD; otherwise code will fall back
+// to CAMERA_NO_PSRAM_FRAME_SIZE.
+const framesize_t CAMERA_RUNTIME_FRAME_SIZE = FRAMESIZE_HD;       // Resolution used after tuning
 const framesize_t CAMERA_NO_PSRAM_FRAME_SIZE = FRAMESIZE_VGA;       // Fallback when PSRAM is unavailable
 
 // ===========================
@@ -69,6 +71,8 @@ String buildGeminiUrl();
 // ===========================
 bool gHasPsram = false;
 framesize_t gActiveFrameSize = CAMERA_RUNTIME_FRAME_SIZE;
+// Last Gemini HTTP status code (set by sendFrameToGemini when non-200)
+int gLastGeminiHttpCode = 0;
 
 // ===========================
 // IR trigger state
@@ -107,32 +111,45 @@ String base64Encode(const uint8_t *data, size_t length) {
     return String();
   }
 
-  size_t outputLength = 0;
-  int result = mbedtls_base64_encode(nullptr, 0, &outputLength, data, length);
-  if (result != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || outputLength == 0) {
-    Serial.printf("[Gemini] Failed to measure base64 length (code %d)\n", result);
-    return String();
+  // Deterministic base64 encoding — avoids any embedded NULs and produces
+  // only chars in the set [A-Za-z0-9+/=]. This is small and portable, and
+  // avoids surprises from library encoders on embedded platforms.
+  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  size_t outLen = ((length + 2) / 3) * 4;
+  String encoded;
+  // Reserve to avoid multiple reallocations; on PSRAM-enabled boards this
+  // will use PSRAM-backed heap for the String buffer.
+  encoded.reserve(outLen + 1);
+
+  size_t i = 0;
+  while (i + 2 < length) {
+    uint32_t val = (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8) |
+                   static_cast<uint32_t>(data[i + 2]);
+    encoded += table[(val >> 18) & 0x3F];
+    encoded += table[(val >> 12) & 0x3F];
+    encoded += table[(val >> 6) & 0x3F];
+    encoded += table[val & 0x3F];
+    i += 3;
   }
 
-  unsigned char *buffer = static_cast<unsigned char *>(malloc(outputLength + 1));
-  if (!buffer) {
-    Serial.println("[Gemini] Base64 malloc failed");
-    return String();
+  if (i < length) {
+    int rem = static_cast<int>(length - i);
+    uint32_t val = static_cast<uint32_t>(data[i]) << 16;
+    if (rem == 2) val |= static_cast<uint32_t>(data[i + 1]) << 8;
+
+    encoded += table[(val >> 18) & 0x3F];
+    encoded += table[(val >> 12) & 0x3F];
+    if (rem == 2) {
+      encoded += table[(val >> 6) & 0x3F];
+      encoded += '=';
+    } else {
+      // rem == 1
+      encoded += '=';
+      encoded += '=';
+    }
   }
 
-  result = mbedtls_base64_encode(buffer, outputLength + 1, &outputLength, data, length);
-  if (result != 0) {
-    Serial.printf("[Gemini] Base64 encode failed (code %d)\n", result);
-    free(buffer);
-    return String();
-  }
-
-  buffer[outputLength] = '\0';
-  String encoded(reinterpret_cast<char *>(buffer));
-  free(buffer);
-
-  encoded.replace("\n", "");
-  encoded.replace("\r", "");
   return encoded;
 }
 
@@ -153,6 +170,29 @@ bool sendFrameToGemini(const uint8_t *buffer, size_t length, String &outSummary)
   if (encoded.isEmpty()) {
     Serial.println("[Gemini] Failed to base64-encode frame");
     return false;
+  }
+
+  // Validate encoded data: non-empty, not excessively large, and contains only
+  // base64 characters. This prevents sending malformed inline_data that causes
+  // INVALID_ARGUMENT from the Gemini API.
+  const size_t MAX_ENCODED_SIZE = 2 * 1024 * 1024; // 2 MB encoded (adjustable)
+  if (encoded.length() == 0) {
+    Serial.println("[Gemini] Encoded data is empty");
+    return false;
+  }
+  if (encoded.length() > MAX_ENCODED_SIZE) {
+    Serial.printf("[Gemini] Encoded data too large: %u bytes\n", (unsigned int)encoded.length());
+    return false;
+  }
+
+  // Verify characters are valid base64 (A-Z, a-z, 0-9, +, /, =)
+  for (size_t i = 0; i < encoded.length(); ++i) {
+    char c = encoded[i];
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c == '+') || (c == '/') || (c == '=');
+    if (!ok) {
+      Serial.printf("[Gemini] Invalid base64 char at %u: 0x%02x\n", (unsigned int)i, (unsigned char)c);
+      return false;
+    }
   }
 
   Serial.printf("[Gemini] Base64 length: %u (raw %u bytes)\n", encoded.length(), static_cast<unsigned int>(length));
@@ -195,6 +235,8 @@ bool sendFrameToGemini(const uint8_t *buffer, size_t length, String &outSummary)
 
   if (httpCode != 200) {
     Serial.println("[Gemini] Request failed: " + response);
+    // Record last HTTP code to allow caller to react (e.g. retry at lower res)
+    gLastGeminiHttpCode = httpCode;
     return false;
   }
 
@@ -230,8 +272,10 @@ bool sendFrameToGemini(const uint8_t *buffer, size_t length, String &outSummary)
   Serial.println("[Gemini] No textual response received");
   return false;
 }
-
 bool captureAndDetectRats() {
+  // Acquire sensor handle early so we can change framesize for fallbacks
+  sensor_t *s = esp_camera_sensor_get();
+
   for (int i = 0; i < CAMERA_WARMUP_FRAMES; ++i) {
     camera_fb_t *tmp = esp_camera_fb_get();
     if (tmp) {
@@ -239,14 +283,52 @@ bool captureAndDetectRats() {
     }
     delay(CAMERA_WARMUP_DELAY_MS);
   }
+  // Try capturing a valid frame (non-empty) with limited retries to avoid
+  // sending empty inline_data which triggers INVALID_ARGUMENT from Gemini.
+  const int maxCaptureAttempts = 6;
+  camera_fb_t *frame = nullptr;
+  for (int attempt = 0; attempt < maxCaptureAttempts; ++attempt) {
+    frame = esp_camera_fb_get();
+    if (frame && frame->len > 100) { // require >100 bytes to be considered valid
+      break;
+    }
+    if (frame) {
+      esp_camera_fb_return(frame);
+      frame = nullptr;
+    }
+    Serial.printf("[Camera] Capture empty or too small (attempt %d/%d), retrying...\n", attempt + 1, maxCaptureAttempts);
+    // Exponential backoff: 100ms, 200ms, 400ms, ...
+    int backoff = 100 * (1 << (attempt < 6 ? attempt : 5));
+    delay(backoff);
+    // After half of attempts, try reducing frame size to improve capture reliability
+    if (attempt == maxCaptureAttempts / 2) {
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        Serial.println("[Camera] Lowering frame size temporarily to improve capture reliability");
+        s->set_framesize(s, CAMERA_NO_PSRAM_FRAME_SIZE);
+      }
+    }
+  }
 
-  camera_fb_t *frame = esp_camera_fb_get();
   if (!frame) {
-    Serial.println("[Camera] Failed to capture frame");
+    Serial.println("[Camera] Failed to capture a valid frame after retries");
     return false;
   }
 
-  Serial.printf("[Camera] Captured frame %dx%d (%u bytes)\n", frame->width, frame->height, (unsigned int)frame->len);
+  Serial.print("[Camera] Captured frame ");
+  Serial.print(frame->width);
+  Serial.print("x");
+  Serial.print(frame->height);
+  Serial.print(" (");
+  Serial.print((unsigned int)frame->len);
+  Serial.println(" bytes)");
+
+  // Ensure we have a non-empty payload before calling Gemini
+  if (frame->len == 0) {
+    esp_camera_fb_return(frame);
+    Serial.println("[Detection] Frame buffer empty, aborting detection");
+    return false;
+  }
 
   String summary;
   bool ok = sendFrameToGemini(frame->buf, frame->len, summary);
@@ -254,6 +336,54 @@ bool captureAndDetectRats() {
 
   if (!ok) {
     Serial.println("[Detection] Gemini detection failed");
+    // If Gemini returned 400 (commonly Base64 decode failed for inline_data),
+    // try adaptive fallbacks: progressively reduce resolution and retry a few
+    // times. This helps when the encoded payload is too large or malformed
+    // for the API to decode.
+    if (gLastGeminiHttpCode == 400 && s) {
+      framesize_t fallbackSizes[] = {FRAMESIZE_SVGA, FRAMESIZE_VGA, FRAMESIZE_QVGA};
+      framesize_t originalSize = static_cast<framesize_t>(s->status.framesize);
+      for (size_t fi = 0; fi < sizeof(fallbackSizes) / sizeof(fallbackSizes[0]); ++fi) {
+        framesize_t candidate = fallbackSizes[fi];
+        // only try sizes smaller than the current active
+        if (candidate >= originalSize) continue;
+
+        Serial.print("[Detection] Retrying with smaller framesize: ");
+        logFrameSize(" -> trying", candidate);
+        s->set_framesize(s, candidate);
+        delay(150); // allow sensor to settle
+
+        camera_fb_t *fb2 = esp_camera_fb_get();
+        if (!fb2) {
+          Serial.println("[Detection] fallback capture failed (no fb)");
+          continue;
+        }
+        if (fb2->len == 0) {
+          Serial.println("[Detection] fallback capture empty");
+          esp_camera_fb_return(fb2);
+          continue;
+        }
+
+        Serial.printf("[Detection] Fallback captured %dx%d (%u bytes)\n", fb2->width, fb2->height, (unsigned int)fb2->len);
+        String summary2;
+        bool ok2 = sendFrameToGemini(fb2->buf, fb2->len, summary2);
+        esp_camera_fb_return(fb2);
+        if (ok2) {
+          Serial.println("[Detection] Fallback detection succeeded");
+          Serial.println(summary2);
+          // restore original framesize
+          s->set_framesize(s, originalSize);
+          gActiveFrameSize = static_cast<framesize_t>(s->status.framesize);
+          return true;
+        }
+        Serial.println("[Detection] Fallback attempt failed");
+        // small delay before next fallback
+        delay(200);
+      }
+
+      // restore original framesize before returning
+      s->set_framesize(s, static_cast<framesize_t>(gActiveFrameSize));
+    }
     return false;
   }
 
@@ -284,16 +414,7 @@ bool captureAndDetectRats() {
       payload += "\"notes\":\"" + String(notes ? notes : "") + "\"";
       payload += "}";
 
-      Serial.println("[BLE] Sending alert to MainSystem: "+ payload);
-      // Attempt to send alert (best-effort)
-      bool sent = false;
-      // Wrap in try/catch style minimal timeout
-      sent = connectAndSendAlert(payload);
-      if (sent) {
-        Serial.println("[BLE] Alert sent successfully");
-      } else {
-        Serial.println("[BLE] Alert failed or MainSystem not reachable");
-      }
+      Serial.println("[Detection] Rat detected — BLE disabled in this build");
     }
   } else {
     Serial.println("[Detection] Unable to parse reply as JSON");
@@ -302,85 +423,9 @@ bool captureAndDetectRats() {
   return true;
 }
 
-// ---------- BLE client helpers ----------
-// UUIDs must match MainSystem.ino
-static BLEUUID serviceUUID("12345678-1234-1234-1234-1234567890ab");
-static BLEUUID charUUID("abcd1234-5678-90ab-cdef-1234567890ab");
+// BLE removed: no UUIDs or client helpers
 
-bool connectAndSendAlert(const String &payload) {
-  // Initialize BLE if needed
-  if (!BLEDevice::getInitialized()) {
-    BLEDevice::init("CameraClient");
-  }
-
-  BLEScan *pBLEScan = BLEDevice::getScan();
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(100);
-  pBLEScan->setWindow(99);
-
-  const int scanTimeSec = 3;
-  Serial.println("[BLE] Scanning for MainSystem...");
-  // Note: depending on ESP32 Arduino core version, start() may return a pointer
-  // to BLEScanResults. Handle pointer return to be compatible.
-  BLEScanResults *results = pBLEScan->start(scanTimeSec, false);
-
-  for (int i = 0; i < results->getCount(); ++i) {
-    BLEAdvertisedDevice adv = results->getDevice(i);
-    // Match by advertised name or service UUID
-    if (adv.haveName() && adv.getName() == "MainSystem") {
-      Serial.println("[BLE] Found device by name: " + adv.getName());
-    } else if (adv.haveServiceUUID() && adv.isAdvertisingService(serviceUUID)) {
-      Serial.println("[BLE] Found device advertising target service");
-    } else {
-      continue;
-    }
-
-    // Try to connect
-    BLEAddress addr = adv.getAddress();
-    Serial.print("[BLE] Connecting to ");
-    Serial.println(addr.toString().c_str());
-    BLERemoteCharacteristic *pRemoteChar = nullptr;
-    BLEClient *pClient = BLEDevice::createClient();
-    if (!pClient->connect(addr)) {
-      Serial.println("[BLE] Failed to connect");
-      pClient->disconnect();
-      delete pClient;
-      continue;
-    }
-
-    BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
-    if (pRemoteService == nullptr) {
-      Serial.println("[BLE] Service not found on device");
-      pClient->disconnect();
-      delete pClient;
-      continue;
-    }
-
-    pRemoteChar = pRemoteService->getCharacteristic(charUUID);
-    if (pRemoteChar == nullptr) {
-      Serial.println("[BLE] Characteristic not found");
-      pClient->disconnect();
-      delete pClient;
-      continue;
-    }
-
-    // Write payload as bytes without std::string
-    const char *dataPtr = payload.c_str();
-    size_t dataLen = payload.length();
-    bool ok = false;
-    if (dataLen > 0) {
-      pRemoteChar->writeValue((uint8_t *)dataPtr, dataLen, false);
-      ok = true;
-    }
-
-    pClient->disconnect();
-    delete pClient;
-    if (ok) return true;
-  }
-
-  Serial.println("[BLE] Scan complete, no suitable device/failed to send");
-  return false;
-}
+// BLE support removed from camera sketch
 
 void startCameraServer();
 void setupLedFlash();
@@ -433,7 +478,10 @@ void setup() {
   //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (gHasPsram) {
-      config.jpeg_quality = 10;
+      // Lower number = better quality. Use higher fidelity when PSRAM available.
+      // Set to 6 for high fidelity. If you want even higher quality and can
+      // accept larger payloads, use 4.
+      config.jpeg_quality = 6;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {

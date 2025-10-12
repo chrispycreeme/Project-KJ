@@ -98,6 +98,16 @@ Notes and caveats:
 - UUIDs used in both sketches are defined in the code; change them in both files if you want custom values.
 - On some ESP32 boards the BLE and WiFi coexistence can impact performance. If you see instability, try lowering WiFi transmit power or tweaking BLE scan parameters.
 
+Camera quality defaults
+-----------------------
+The camera sketch now defaults to higher-quality settings when PSRAM is available:
+
+- Runtime frame size: UXGA when PSRAM detected (falls back to VGA without PSRAM).
+- JPEG quality: improved when PSRAM is present (higher fidelity).
+- Warmup frames: increased to 3 to allow the camera sensor to stabilize before captures.
+
+These settings improve image clarity for Gemini detection but increase RAM/IRAM usage and firmware size. If you face memory/linker issues, reduce `CAMERA_RUNTIME_FRAME_SIZE` or raise `jpeg_quality` (larger number = lower quality, smaller output).
+
 Optional: disabling the built-in camera webserver to reduce firmware size
 ---------------------------------------------------------------
 The camera sketch includes the standard ESP32 camera webserver which increases flash/IRAM usage. If you experience IRAM overflow during linking, you can disable the webserver by not defining `ENABLE_CAMERA_WEBSERVER` before building (it's disabled by default in this repo). To enable the webserver, add `#define ENABLE_CAMERA_WEBSERVER` at the top of `CameraWebServer.ino` or add it as a build flag in your PlatformIO/Arduino build configuration.
