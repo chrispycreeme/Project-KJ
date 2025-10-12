@@ -21,6 +21,12 @@
 #include "camera_index.h"
 #include "board_config.h"
 
+// Arduino compiles .ino and .cpp separately; ensure the webserver implementation
+// is compiled by defining this macro here when the sketch intends to enable it.
+#ifndef ENABLE_CAMERA_WEBSERVER
+#define ENABLE_CAMERA_WEBSERVER
+#endif
+
 #ifdef ENABLE_CAMERA_WEBSERVER
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
