@@ -25,7 +25,7 @@ A comprehensive AI-powered rat detection system combining desktop application, c
   <summary>ESP32 sketches (expand)</summary>
 
   - `MainSystem.ino` — BLE GATT server that advertises as `MainSystem` and prints received JSON alert payloads to Serial.
-  - `camera/CameraWebServer.ino` — Camera sketch that captures images, calls Gemini, and attempts a BLE write to `MainSystem` with a JSON alert like `{"rat_detected":true, "confidence":0.92}` when detections occur.
+  - `camera/CameraWebServer.ino` — Camera sketch that captures images, and attempts a BLE write to `MainSystem` with a JSON alert like `{"rat_detected":true, "confidence":0.92}` when detections occur.
 
   **Notes:**
   - BLE writes are best-effort; range and coexistence with WiFi can affect reliability.
