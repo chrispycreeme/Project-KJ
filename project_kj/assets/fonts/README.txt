@@ -1,0 +1,1 @@
+Product Sans is a proprietary font. Add the licensed font files (for example, ProductSans-Regular.ttf and ProductSans-Bold.ttf) to this folder and declare them in pubspec.yaml if you have redistribution rights.

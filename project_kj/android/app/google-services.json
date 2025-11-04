@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1034277904400",
+    "project_id": "project-kj-ae694",
+    "storage_bucket": "project-kj-ae694.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1034277904400:android:e4da3e02553560b243ea95",
+        "android_client_info": {
+          "package_name": "com.rshs.project_kj"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDLn-oPKFyTHpKcA9CpUHSF1Tx2iRMzSjQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
