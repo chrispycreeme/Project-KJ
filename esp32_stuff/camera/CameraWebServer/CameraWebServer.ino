@@ -5,11 +5,8 @@
 #define IRAM_ATTR
 #define ICACHE_RAM_ATTR
 
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEClient.h>
-#include "esp_camera.h"
 #include <WiFi.h>
+#include "esp_camera.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -19,11 +16,9 @@
 const char *ssid = "Familia";
 const char *password = "#Jeuel1317";
 const char *geminiApiKey = "AIzaSyB-7fuqQgJlRIOa4TlflXRNq9TLSW2qqWw";
-const char *geminiModel = "gemini-1.5-flash";
+const char *geminiModel = "gemini-2.5-flash-lite";
 
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-const char* mainSystemDeviceName = "MainSystemESP32";
+// BLE removed: using wired Serial1 to communicate with MainSystem
 
 const int IR_SENSOR_PIN = 14;
 const bool IR_ACTIVE_LOW = true;
@@ -31,14 +26,18 @@ const unsigned long IR_COOLDOWN_MS = 5000;
 const framesize_t FRAME_SIZE = FRAMESIZE_VGA;  // Reduced to VGA (640x480)
 
 // Global state
-BLEClient* pClient = nullptr;
-BLERemoteCharacteristic* pRemoteChar = nullptr;
-bool bleConnected = false;
+// (BLE removed) no BLE client state
 unsigned long lastTrigger = 0;
 int lastIrState = IR_ACTIVE_LOW ? HIGH : LOW;
 
 // Base64 encoding table in PROGMEM to save RAM
 const char b64_table[] PROGMEM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// ----- Serial wiring to MainSystem (wired UART) -----
+// Wire CAMERA TX -> MAIN RX, CAMERA RX -> MAIN TX, and common GND.
+const int CAMERA_SERIAL_RX = 16; // receives from Main TX
+const int CAMERA_SERIAL_TX = 17; // transmits to Main RX
+const unsigned long IPC_BAUD = 115200;
 
 // Minimal base64 encoder
 String b64(const uint8_t *d, size_t len) {
@@ -59,55 +58,7 @@ String b64(const uint8_t *d, size_t len) {
   return out;
 }
 
-// Minimal BLE connection
-bool bleCon() {
-  BLEScanResults* res = BLEDevice::getScan()->start(5, false);
-  BLEAdvertisedDevice* dev = nullptr;
-  
-  for (int i = 0; i < res->getCount(); i++) {
-    BLEAdvertisedDevice d = res->getDevice(i);
-    if (d.getName() == mainSystemDeviceName) {
-      dev = new BLEAdvertisedDevice(d);
-      break;
-    }
-  }
-  
-  BLEDevice::getScan()->clearResults();
-  if (!dev) return false;
-  
-  if (!pClient) pClient = BLEDevice::createClient();
-  if (!pClient->connect(dev)) {
-    delete dev;
-    return false;
-  }
-  
-  BLERemoteService* svc = pClient->getService(SERVICE_UUID);
-  if (!svc) {
-    pClient->disconnect();
-    delete dev;
-    return false;
-  }
-  
-  pRemoteChar = svc->getCharacteristic(CHARACTERISTIC_UUID);
-  delete dev;
-  
-  if (!pRemoteChar) {
-    pClient->disconnect();
-    return false;
-  }
-  
-  bleConnected = true;
-  return true;
-}
-
-// Send BLE command
-void bleCmd(const char* cmd) {
-  if (!bleConnected || !pClient || !pClient->isConnected()) {
-    bleConnected = false;
-    if (!bleCon()) return;
-  }
-  if (pRemoteChar) pRemoteChar->writeValue((uint8_t*)cmd, strlen(cmd));
-}
+// (BLE removed) no BLE helper functions
 
 // Gemini detection
 bool detect() {
@@ -178,7 +129,16 @@ bool detect() {
           bool rat = res["rat_detected"] | false;
           if (rat) {
             Serial.println("RAT DETECTED!");
-            bleCmd("process");
+            // Send a small JSON payload over UART to the MainSystem
+            String payload = "{";
+            payload += "\"rat_detected\":true,";
+            payload += "\"confidence\":1.00"; // replace with actual confidence if available
+            payload += "}";
+            if (Serial1) {
+              Serial1.println(payload);
+              Serial.println("Sent IPC to MainSystem: " + payload);
+            }
+            // sent over Serial1 to MainSystem; no BLE fallback configured
             return true;
           }
         }
@@ -191,6 +151,9 @@ bool detect() {
 
 void setup() {
   Serial.begin(115200);
+  // Wired IPC to MainSystem
+  Serial1.begin(IPC_BAUD, SERIAL_8N1, CAMERA_SERIAL_RX, CAMERA_SERIAL_TX);
+  Serial.println("Serial1 (to MainSystem) initialized at 115200");
   delay(100);
   
   // Camera init
@@ -248,14 +211,7 @@ void setup() {
   
   Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi FAIL");
   
-  // BLE
-  BLEDevice::init("CameraESP32");
-  BLEScan* scan = BLEDevice::getScan();
-  scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(99);
-  
-  bleCon();
+  // (BLE removed) using wired Serial1 for IPC to MainSystem
   
   // IR
   pinMode(IR_SENSOR_PIN, IR_ACTIVE_LOW ? INPUT_PULLUP : INPUT);

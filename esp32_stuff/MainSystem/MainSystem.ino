@@ -4,15 +4,108 @@
 // When "stop" is received the relay is deactivated.
 // Sends acknowledgements back over Serial.
 
-// ----- Added for Bluetooth -----
-#include "BluetoothSerial.h"
+// Bluetooth removed: using wired Serial1 between Camera and MainSystem
 
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
+// ----- WiFi + Firestore (optional REST endpoint) -----
+#include <WiFi.h>
+#include <HTTPClient.h>
 
-BluetoothSerial SerialBT;
-// -----------------------------
+// NOTE: update these to match your network and Firestore details.
+const char* WIFI_SSID = "Familia"; // default pulled from Camera sketch
+const char* WIFI_PASS = "#Jeuel1317";
+
+// Firestore REST configuration (you must provide these)
+const char* FIRESTORE_PROJECT_ID = "project-kj-ae694";
+const char* FIRESTORE_API_KEY = "AIzaSyBVL1diBMHTH6jl2uYKR94DrzOJmkXTyAE";
+const char* FIRESTORE_COLLECTION = "detections"; // collection to write docs into
+
+// Helper to build the Firestore REST URL for creating documents in a collection
+String firestoreDocumentsUrl() {
+  String url = "https://firestore.googleapis.com/v1/projects/";
+  url += FIRESTORE_PROJECT_ID;
+  url += "/databases/(default)/documents/";
+  url += FIRESTORE_COLLECTION;
+  url += "?key=";
+  url += FIRESTORE_API_KEY;
+  return url;
+}
+
+// ----- Serial wiring to CameraWebServer -----
+// These pins are the UART pins used for the wired connection between the two ESP32s.
+// Wire Camera TX -> Main RX, Camera RX -> Main TX, and common GND between boards.
+const int MAIN_SERIAL_RX = 16; // connect to CAMERA TX
+const int MAIN_SERIAL_TX = 17; // connect to CAMERA RX
+const unsigned long IPC_BAUD = 115200;
+
+// Send a minimal detection payload to the configured HTTP endpoint.
+// This is intentionally generic: many Firestore setups require auth (service account or OAuth)
+// so you can point FIRESTORE_URL to a Cloud Function that accepts an unauthenticated POST
+// and then writes to Firestore using admin credentials. Adjust as needed.
+void sendDetectionToFirestore(const String &cameraId, float confidence) {
+  // Ensure WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("WiFi not connected, attempting to connect to "); Serial.println(WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+      delay(250);
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WARN: still not connected to WiFi, aborting Firestore commit");
+    return;
+  }
+
+  // Prepare Firestore commit to:
+  //  - create a new log document under trap_controller/primary/logs/{docId}
+  //  - set its timestamp to server time
+  //  - increment trap_controller/primary.rat_detected_count by 1 and set updated_at to server time
+  String docId = "log_" + String(millis());
+  String project = String(FIRESTORE_PROJECT_ID);
+  String baseDocPath = "projects/" + project + "/databases/(default)/documents";
+  String logDocName = baseDocPath + "/trap_controller/primary/logs/" + docId;
+  String mainDocName = baseDocPath + "/trap_controller/primary";
+
+  // Build JSON payload for commit
+  String payload = "{\"writes\":[";
+
+  // 1) create the new log document with label and payload (camera/confidence)
+  payload += "{\"update\":{\"name\":\"" + logDocName + "\",\"fields\":{";
+  payload += "\"label\":{\"stringValue\":\"detection\"},";
+  payload += "\"payload\":{\"mapValue\":{\"fields\":{";
+  payload += "\"camera\":{\"stringValue\":\"" + cameraId + "\"},";
+  payload += "\"confidence\":{\"doubleValue\": " + String(confidence, 2) + "}";
+  payload += "}}}}}"; // close payload,mapValue,fields,update
+  payload += ",";
+
+  // 2) set the timestamp on the new log doc to server time
+  payload += "{\"transform\":{\"document\":\"" + logDocName + "\",\"fieldTransforms\":[{\"fieldPath\":\"timestamp\",\"setToServerValue\":\"REQUEST_TIME\"}]}}";
+  payload += ",";
+
+  // 3) increment rat_detected_count and set updated_at on the main document
+  payload += "{\"transform\":{\"document\":\"" + mainDocName + "\",\"fieldTransforms\":[";
+  payload += "{\"fieldPath\":\"updated_at\",\"setToServerValue\":\"REQUEST_TIME\"},";
+  payload += "{\"fieldPath\":\"rat_detected_count\",\"increment\":{\"integerValue\":\"1\"}}";
+  payload += "]}}";
+
+  payload += "]}"; // end writes array and root object
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents:commit?key=" + String(FIRESTORE_API_KEY);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  if (code > 0) {
+    Serial.print("Firestore commit code: "); Serial.println(code);
+    String resp = http.getString();
+    Serial.print("Firestore commit response: "); Serial.println(resp);
+  } else {
+    Serial.print("Firestore commit failed, error: "); Serial.println(http.errorToString(code));
+  }
+  http.end();
+}
 
 // ----- Configuration -----
 const int RELAY_PIN = 23; // change to the GPIO pin connected to the relay module
@@ -320,10 +413,12 @@ void setup() {
     delay(10);
   }
 
-  // ----- Added for Bluetooth -----
-  SerialBT.begin("MainSystemESP32"); // Set the Bluetooth device name
-  Serial.println("Bluetooth device active, waiting for connections.");
-  // -----------------------------
+  // Initialize wired serial (UART) to camera
+  // MAIN_SERIAL_RX is the pin that receives data from the camera (camera TX)
+  // MAIN_SERIAL_TX is the pin that transmits data to the camera (camera RX)
+  Serial1.begin(IPC_BAUD, SERIAL_8N1, MAIN_SERIAL_RX, MAIN_SERIAL_TX);
+  Serial.println("Serial1 (to Camera) initialized at 115200");
+
 
   // Initialize relay pin
   pinMode(RELAY_PIN, OUTPUT);
@@ -342,7 +437,7 @@ void setup() {
 
   // Initialize BTS7960 motor driver
   motorInit();
-  Serial.println("MainSystem ready. Send commands via USB Serial or Bluetooth.");
+  Serial.println("MainSystem ready. Send commands via USB Serial.");
   Serial.println("Servo commands: 'servo1 <angle>', 'servo2 <angle>', 'servoAll <angle>' (0-180)");
   Serial.println("Motor commands: 'motor <speed>' (-255..255), 'motor brake', 'motor coast', 'motor stop'");
   Serial.println("Alternate: 'motor reverse <speed>' or 'motor rev <speed>' to set reverse direction, or 'motor rev' to toggle direction at current speed");
@@ -362,15 +457,34 @@ void loop() {
     }
   }
 
-  // Check for an incoming line from Bluetooth Serial
-  if (SerialBT.available()) {
-    String cmd = SerialBT.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.length() > 0) {
-      Serial.print("Received Bluetooth command: '");
-      Serial.print(cmd);
-      Serial.println("'");
-      handleCommand(cmd);
+  // (Bluetooth removed) commands may still come in via USB Serial
+
+  // Check for simple IPC messages from Camera over wired Serial1
+  if (Serial1.available()) {
+    String line = Serial1.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      Serial.print("IPC from Camera: '"); Serial.print(line); Serial.println("'");
+      // handle a few simple message types
+      if (line.indexOf("RAT") >= 0 || line.indexOf("TRIGGER") >= 0 || line.indexOf("detected") >= 0) {
+        // kick off the local process sequence
+        handleCommand("process");
+        // try to extract a confidence float if present in a JSON-like payload
+        float conf = 0.0;
+        int cidx = line.indexOf("confidence");
+        if (cidx >= 0) {
+          int colon = line.indexOf(':', cidx);
+          if (colon >= 0) {
+            String num = line.substring(colon + 1);
+            // strip non-digit trailing
+            int end = 0;
+            while (end < (int)num.length() && (isDigit(num[end]) || num[end]=='.')) end++;
+            num = num.substring(0, end);
+            conf = num.toFloat();
+          }
+        }
+        sendDetectionToFirestore("CameraESP32", conf);
+      }
     }
   }
 
