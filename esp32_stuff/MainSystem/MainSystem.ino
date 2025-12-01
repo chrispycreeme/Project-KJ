@@ -1,493 +1,308 @@
-// MainSystem.ino
-// ESP32 sketch: listens on Serial and Bluetooth for text commands.
-// When "start" is received the relay is activated.
-// When "stop" is received the relay is deactivated.
-// Sends acknowledgements back over Serial.
-
-// Bluetooth removed: using wired Serial1 between Camera and MainSystem
-
-// ----- WiFi + Firestore (optional REST endpoint) -----
-#include <WiFi.h>
-#include <HTTPClient.h>
-
-// NOTE: update these to match your network and Firestore details.
-const char* WIFI_SSID = "Familia"; // default pulled from Camera sketch
-const char* WIFI_PASS = "#Jeuel1317";
-
-// Firestore REST configuration (you must provide these)
-const char* FIRESTORE_PROJECT_ID = "project-kj-ae694";
-const char* FIRESTORE_API_KEY = "AIzaSyBVL1diBMHTH6jl2uYKR94DrzOJmkXTyAE";
-const char* FIRESTORE_COLLECTION = "detections"; // collection to write docs into
-
-// Helper to build the Firestore REST URL for creating documents in a collection
-String firestoreDocumentsUrl() {
-  String url = "https://firestore.googleapis.com/v1/projects/";
-  url += FIRESTORE_PROJECT_ID;
-  url += "/databases/(default)/documents/";
-  url += FIRESTORE_COLLECTION;
-  url += "?key=";
-  url += FIRESTORE_API_KEY;
-  return url;
-}
-
-// ----- Serial wiring to CameraWebServer -----
-// These pins are the UART pins used for the wired connection between the two ESP32s.
-// Wire Camera TX -> Main RX, Camera RX -> Main TX, and common GND between boards.
-const int MAIN_SERIAL_RX = 16; // connect to CAMERA TX
-const int MAIN_SERIAL_TX = 17; // connect to CAMERA RX
-const unsigned long IPC_BAUD = 115200;
-
-// Send a minimal detection payload to the configured HTTP endpoint.
-// This is intentionally generic: many Firestore setups require auth (service account or OAuth)
-// so you can point FIRESTORE_URL to a Cloud Function that accepts an unauthenticated POST
-// and then writes to Firestore using admin credentials. Adjust as needed.
-void sendDetectionToFirestore(const String &cameraId, float confidence) {
-  // Ensure WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.print("WiFi not connected, attempting to connect to "); Serial.println(WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
-      delay(250);
-    }
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WARN: still not connected to WiFi, aborting Firestore commit");
-    return;
-  }
-
-  // Prepare Firestore commit to:
-  //  - create a new log document under trap_controller/primary/logs/{docId}
-  //  - set its timestamp to server time
-  //  - increment trap_controller/primary.rat_detected_count by 1 and set updated_at to server time
-  String docId = "log_" + String(millis());
-  String project = String(FIRESTORE_PROJECT_ID);
-  String baseDocPath = "projects/" + project + "/databases/(default)/documents";
-  String logDocName = baseDocPath + "/trap_controller/primary/logs/" + docId;
-  String mainDocName = baseDocPath + "/trap_controller/primary";
-
-  // Build JSON payload for commit
-  String payload = "{\"writes\":[";
-
-  // 1) create the new log document with label and payload (camera/confidence)
-  payload += "{\"update\":{\"name\":\"" + logDocName + "\",\"fields\":{";
-  payload += "\"label\":{\"stringValue\":\"detection\"},";
-  payload += "\"payload\":{\"mapValue\":{\"fields\":{";
-  payload += "\"camera\":{\"stringValue\":\"" + cameraId + "\"},";
-  payload += "\"confidence\":{\"doubleValue\": " + String(confidence, 2) + "}";
-  payload += "}}}}}"; // close payload,mapValue,fields,update
-  payload += ",";
-
-  // 2) set the timestamp on the new log doc to server time
-  payload += "{\"transform\":{\"document\":\"" + logDocName + "\",\"fieldTransforms\":[{\"fieldPath\":\"timestamp\",\"setToServerValue\":\"REQUEST_TIME\"}]}}";
-  payload += ",";
-
-  // 3) increment rat_detected_count and set updated_at on the main document
-  payload += "{\"transform\":{\"document\":\"" + mainDocName + "\",\"fieldTransforms\":[";
-  payload += "{\"fieldPath\":\"updated_at\",\"setToServerValue\":\"REQUEST_TIME\"},";
-  payload += "{\"fieldPath\":\"rat_detected_count\",\"increment\":{\"integerValue\":\"1\"}}";
-  payload += "]}}";
-
-  payload += "]}"; // end writes array and root object
-
-  String url = "https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents:commit?key=" + String(FIRESTORE_API_KEY);
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(payload);
-  if (code > 0) {
-    Serial.print("Firestore commit code: "); Serial.println(code);
-    String resp = http.getString();
-    Serial.print("Firestore commit response: "); Serial.println(resp);
-  } else {
-    Serial.print("Firestore commit failed, error: "); Serial.println(http.errorToString(code));
-  }
-  http.end();
-}
-
-// ----- Configuration -----
-const int RELAY_PIN = 23; // change to the GPIO pin connected to the relay module
-const bool RELAY_ACTIVE_HIGH = true; // set to false if your relay is active LOW
-
-// Servo configuration
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32) || defined(ARDUINO_ESP32)
-// Use the ESP32-compatible Servo library. Install "ESP32Servo" via Library Manager if missing.
 #include <ESP32Servo.h>
-#else
-#include <Servo.h>
-#endif
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
 
-#include <Arduino.h>
+// ===== HARDCODED CREDENTIALS - CHANGE THESE =====
+const char* WIFI_SSID = "ProjectKJ";
+const char* WIFI_PASSWORD = "projectkj";
+// ===============================================
 
-// Note: ESP32 LEDC prototypes are provided by the core headers; do not redeclare them here.
-const int SERVO1_PIN = 18; // GPIO for servo 1 (change if needed)
-const int SERVO2_PIN = 19; // GPIO for servo 2 (change if needed)
+// UDP Beacon
+WiFiUDP udpBeacon;
+const int UDP_BEACON_PORT = 4210;
+const char* BEACON_MSG = "ESP32_MAIN_HERE";
+unsigned long lastBeaconTime = 0;
+const unsigned long beaconInterval = 1000;
+
+// Web Server
+WebServer server(80);
+
+// BTS7960 Motor Driver
+#define R_EN 19
+#define RPWM 18
+#define L_EN 5
+#define LPWM 17
+
+// Relay for CO2
+#define RELAY_PIN 16
+
+// Servos
+#define SERVO1_PIN 27
+#define SERVO2_PIN 26
+
+// LEDs
+#define GREEN_LED_PIN 12
+#define RED_LED_PIN 14
+
+// Buzzer
+#define BUZZER_PIN 25
+
+// PWM
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 8
+#define PWM_CHANNEL_RPWM 0
+#define PWM_CHANNEL_LPWM 1
 
 Servo servo1;
 Servo servo2;
 
-int servo1Pos = 90; // initial center position
-int servo2Pos = 90; // initial center position
+int startCounter = 0;
 
-// Process sequence configuration
-const int SERVO_OPEN_POS = 30; // angle for 'open' (change as needed)
-const int SERVO_CLOSE_POS = 150; // angle for 'close'
-// Make quick servo motions longer by increasing delay and repeats
-const unsigned long SERVO_QUICK_DELAY = 500; // ms between open/close for slower/longer motion
-const int SERVO_QUICK_REPEATS = 1; // how many open/close cycles
+// Timing (milliseconds)
+unsigned long TRAPDOOR_OPEN_TIME   = 500;
+unsigned long TRAPDOOR_CLOSE_TIME  = 500;
+unsigned long TRAPDOOR_STOP_PAUSE  = 500;
+unsigned long CO2_RELAY_ON_TIME    = 10000;
+unsigned long CO2_RELAY_OFF_PAUSE  = 500;
+unsigned long FEED_OPEN_TIME       = 2000;
+unsigned long FEED_CLOSE_TIME      = 1000;
 
-// Trapdoor motor: increase duration to open/close more fully/slowly
-const int TRAPDOOR_MOTOR_OPEN_SPEED = 255; // 0-255 magnitude
-const unsigned long TRAPDOOR_MOTOR_DURATION = 500; // ms to hold open/close (longer)
-
-// Helper: quick open/close motion for both servos
-void quickServoBlink() {
-  for (int r = 0; r < SERVO_QUICK_REPEATS; ++r) {
-    servo1.write(SERVO_OPEN_POS);
-    servo2.write(SERVO_OPEN_POS);
-    delay(SERVO_QUICK_DELAY);
-    servo1.write(SERVO_CLOSE_POS);
-    servo2.write(SERVO_CLOSE_POS);
-    delay(SERVO_QUICK_DELAY);
-  }
-  // return to center
-  servo1.write(servo1Pos);
-  servo2.write(servo2Pos);
-}
-
-// Helper: open then close trapdoor using motor (forward = open, reverse = close)
-void motorTrapdoorOpenClose() {
-  // open (forward)
-  setMotor(TRAPDOOR_MOTOR_OPEN_SPEED);
-  delay(TRAPDOOR_MOTOR_DURATION);
-  motorCoast();
-  delay(100);
-
-  // close (reverse)
-  setMotor(-TRAPDOOR_MOTOR_OPEN_SPEED);
-  delay(TRAPDOOR_MOTOR_DURATION);
-  motorCoast();
-}
-
-// ----- BTS7960 motor driver configuration -----
-// Default pins (change to match your wiring)
-const int BTS_LPWM_PIN = 25; // LPWM (left/input A)
-const int BTS_RPWM_PIN = 26; // RPWM (right/input B)
-const int BTS_L_EN_PIN = 27; // L_EN (enable for left)
-const int BTS_R_EN_PIN = 14; // R_EN (enable for right)
-
-// PWM configuration (using analogWrite for portability)
-// Note: On ESP32 core versions analogWrite is provided;
-// ensure BTS_LPWM_PIN/BTS_RPWM_PIN are PWM-capable.
-
-// Current motor state
-int motorSpeed = 0; // -255..255
-
-// Process invocation counter
-int processCount = 0;
-
-// Initialize BTS7960 pins and PWM
-void motorInit() {
-  pinMode(BTS_L_EN_PIN, OUTPUT);
-  pinMode(BTS_R_EN_PIN, OUTPUT);
-  // start disabled (coast)
-  digitalWrite(BTS_L_EN_PIN, LOW);
-  digitalWrite(BTS_R_EN_PIN, LOW);
-  // Use analogWrite for PWM on both platforms for portability.
-  pinMode(BTS_LPWM_PIN, OUTPUT);
-  pinMode(BTS_RPWM_PIN, OUTPUT);
-  analogWrite(BTS_LPWM_PIN, 0);
-  analogWrite(BTS_RPWM_PIN, 0);
-}
-
-// Set motor speed: -255..255 (negative = reverse)
-void setMotor(int speed) {
-  motorSpeed = constrain(speed, -255, 255);
-  if (motorSpeed == 0) {
-    // coast by disabling enables
-    digitalWrite(BTS_L_EN_PIN, LOW);
-    digitalWrite(BTS_R_EN_PIN, LOW);
-    analogWrite(BTS_LPWM_PIN, 0);
-    analogWrite(BTS_RPWM_PIN, 0);
-    return;
-  }
-
-  // enable driver
-  digitalWrite(BTS_L_EN_PIN, HIGH);
-  digitalWrite(BTS_R_EN_PIN, HIGH);
-
-  int duty = abs(motorSpeed); // 0..255
-  if (motorSpeed > 0) {
-    // forward: PWM on R channel, L channel zero
-    analogWrite(BTS_LPWM_PIN, 0);
-    analogWrite(BTS_RPWM_PIN, duty);
-  } else {
-    // reverse: PWM on L channel, R channel zero
-    analogWrite(BTS_LPWM_PIN, duty);
-    analogWrite(BTS_RPWM_PIN, 0);
-  }
-}
-
-// Brake: short both motor terminals -> set both PWM to max and enable
-void motorBrake() {
-  digitalWrite(BTS_L_EN_PIN, HIGH);
-  digitalWrite(BTS_R_EN_PIN, HIGH);
-  analogWrite(BTS_LPWM_PIN, 255);
-  analogWrite(BTS_RPWM_PIN, 255);
-  motorSpeed = 0;
-}
-
-// Coast: disable outputs
-void motorCoast() {
-  digitalWrite(BTS_L_EN_PIN, LOW);
-  digitalWrite(BTS_R_EN_PIN, LOW);
-  analogWrite(BTS_LPWM_PIN, 0);
-  analogWrite(BTS_RPWM_PIN, 0);
-  motorSpeed = 0;
-}
-
-// Helper to set relay state
-void setRelay(bool on) {
-  if (RELAY_ACTIVE_HIGH) {
-    digitalWrite(RELAY_PIN, on ? HIGH : LOW);
-  } else {
-    digitalWrite(RELAY_PIN, on ? LOW : HIGH);
-  }
-}
-
-// ----- New function to handle commands from any source -----
-void handleCommand(String cmd) {
-  // normalize
-  for (unsigned int i = 0; i < cmd.length(); ++i) cmd[i] = tolower(cmd[i]);
-  // parse servo commands: they can be like 'servo1 90' or 'servoAll 45'
-  if (cmd.startsWith("servo1 ") || cmd.startsWith("servo2 ") || cmd.startsWith("servoall ")) {
-    // split into token and value
-    int spaceIdx = cmd.indexOf(' ');
-    String token = (spaceIdx > 0) ? cmd.substring(0, spaceIdx) : cmd;
-    String val = (spaceIdx > 0) ? cmd.substring(spaceIdx + 1) : "";
-    val.trim();
-    if (val.length() == 0) {
-      Serial.println("ERR: missing angle value (0-180)");
-    } else {
-      int angle = val.toInt();
-      if (angle < 0 || angle > 180) {
-        Serial.println("ERR: angle out of range (0-180)");
-      } else {
-        if (token == "servo1") {
-          servo1Pos = angle;
-          servo1.write(angle);
-          Serial.print("OK: servo1 set to "); Serial.println(angle);
-        } else if (token == "servo2") {
-          servo2Pos = angle;
-          servo2.write(angle);
-          Serial.print("OK: servo2 set to "); Serial.println(angle);
-        } else if (token == "servoall") {
-          servo1Pos = angle;
-          servo2Pos = angle;
-          servo1.write(angle);
-          servo2.write(angle);
-          Serial.print("OK: both servos set to "); Serial.println(angle);
-        }
-      }
-    }
-    return; // handled - exit this loop() iteration
-  }
-
-  // parse motor reverse commands first: 'motor rev' or 'motor reverse'
-  if (cmd.startsWith("motor rev") || cmd.startsWith("motor reverse")) {
-    // optionally with a value: 'motor rev 100' -> set to -100
-    int spaceIdx = cmd.indexOf(' ');
-    String rest = (spaceIdx >= 0) ? cmd.substring(spaceIdx + 1) : "";
-    rest.trim();
-    // remove leading 'rev' or 'reverse'
-    int subSpace = rest.indexOf(' ');
-    String token = (subSpace >= 0) ? rest.substring(0, subSpace) : rest;
-    String val = (subSpace >= 0) ? rest.substring(subSpace + 1) : "";
-    token.trim(); val.trim();
-    if (val.length() == 0) {
-      // toggle direction at same magnitude
-      if (motorSpeed == 0) {
-        Serial.println("ERR: motor is stopped, provide speed to reverse");
-      } else {
-        setMotor(-motorSpeed);
-        Serial.print("OK: motor direction toggled to "); Serial.println(motorSpeed);
-      }
-      return;
-    } else {
-      int sp = val.toInt();
-      if (sp < 0 || sp > 255) {
-        Serial.println("ERR: motor speed must be between 0 and 255 for reverse command");
-      } else {
-        setMotor(-sp);
-        Serial.print("OK: motor set to reverse "); Serial.println(-sp);
-      }
-      return;
-    }
-  }
-
-  // parse motor commands: 'motor <speed>' or 'motor brake' / 'motor coast' / 'motor stop'
-  if (cmd.startsWith("motor ")) {
-    String arg = cmd.substring(6);
-    arg.trim();
-    if (arg.length() == 0) {
-      Serial.println("ERR: missing motor argument");
-      return;
-    }
-    if (arg == "brake") {
-      motorBrake();
-      Serial.println("OK: motor braked");
-      return;
-    } else if (arg == "coast" || arg == "stop") {
-      motorCoast();
-      Serial.println("OK: motor coasting");
-      return;
-    } else {
-      // expect a speed value
-      int sp = arg.toInt();
-      if (sp < -255 || sp > 255) {
-        Serial.println("ERR: motor speed must be between -255 and 255");
-      } else {
-        setMotor(sp);
-        Serial.print("OK: motor set to "); Serial.println(sp);
-      }
-      return;
-    }
-  }
-
-  if (cmd == "start") {
-    setRelay(true);
-    Serial.println("OK: relay activated");
-  } else if (cmd == "stop") {
-    setRelay(false);
-    Serial.println("OK: relay deactivated");
-  } else if (cmd == "process") {
-    Serial.println("PROCESS: starting sequence");
-    // 1) motor trapdoor open/close
-    motorTrapdoorOpenClose();
-    Serial.println("PROCESS: motor trapdoor open/close done");
-    // increment process counter
-    processCount++;
-    // 2) activate relay only on every 5th process
-    if (processCount % 5 == 0) {
-      // Turn relay ON, wait 5 seconds, then turn OFF
-      setRelay(true);
-      Serial.println("PROCESS: relay activated (5th run)");
-      delay(5000); // wait 5 seconds while relay is ON
-      setRelay(false);
-      Serial.println("PROCESS: relay deactivated after 5s");
-    } else {
-      Serial.print("PROCESS: relay skipped (run "); Serial.print(processCount); Serial.println(")");
-    }
-
-    // 3) final servos always run
-    quickServoBlink();
-    Serial.println("PROCESS: final servos quick motion done");
-
-    Serial.println("PROCESS: sequence complete");
-  } else if (cmd == "toggle") {
-    // read current state and toggle
-    int cur = digitalRead(RELAY_PIN);
-    bool on;
-    if (RELAY_ACTIVE_HIGH) on = (cur == HIGH);
-    else on = (cur == LOW);
-    setRelay(!on);
-    Serial.print("OK: relay toggled to ");
-    Serial.println(!on ? "ON" : "OFF");
-  } else if (cmd.length() == 0) {
-    // ignore
-  } else {
-    Serial.print("ERR: unknown command: '");
-    Serial.print(cmd);
-    Serial.println("' (valid: start, stop, toggle)");
-  }
-}
-
-// ----- Implementation -----
 void setup() {
-  // Initialize serial
   Serial.begin(115200);
-  while (!Serial) {
-    // wait (on some boards) for serial to become available
-    delay(10);
-  }
-
-  // Initialize wired serial (UART) to camera
-  // MAIN_SERIAL_RX is the pin that receives data from the camera (camera TX)
-  // MAIN_SERIAL_TX is the pin that transmits data to the camera (camera RX)
-  Serial1.begin(IPC_BAUD, SERIAL_8N1, MAIN_SERIAL_RX, MAIN_SERIAL_TX);
-  Serial.println("Serial1 (to Camera) initialized at 115200");
-
-
-  // Initialize relay pin
+  delay(1000);
+  Serial.println("\n=== ESP32 Main Controller ===");
+  Serial.println("Rat Trap System v3.0 (Simplified)");
+  Serial.println("====================================");
+  
+  // Initialize pins
+  pinMode(R_EN, OUTPUT);
+  pinMode(L_EN, OUTPUT);
+  digitalWrite(R_EN, HIGH);
+  digitalWrite(L_EN, HIGH);
+  
+  ledcAttach(RPWM, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LPWM, PWM_FREQ, PWM_RESOLUTION);
+  
   pinMode(RELAY_PIN, OUTPUT);
-  // Ensure relay starts in OFF state
-  if (RELAY_ACTIVE_HIGH) {
-    digitalWrite(RELAY_PIN, LOW);
-  } else {
-    digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(RELAY_PIN, LOW);
+  
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(RED_LED_PIN, HIGH);
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  ESP32PWM::allocateTimer(2);
+  servo1.setPeriodHertz(50);
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo2.setPeriodHertz(50);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+  
+  servo1.write(0);
+  servo2.write(0);
+  
+  // Connect to WiFi
+  Serial.println("\n[WiFi] Connecting...");
+  connectToWiFi();
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Failed! Restarting...");
+    delay(5000);
+    ESP.restart();
   }
-
-  // Attach servos and set initial positions
-  servo1.attach(SERVO1_PIN);
-  servo2.attach(SERVO2_PIN);
-  servo1.write(constrain(servo1Pos, 0, 180));
-  servo2.write(constrain(servo2Pos, 0, 180));
-
-  // Initialize BTS7960 motor driver
-  motorInit();
-  Serial.println("MainSystem ready. Send commands via USB Serial.");
-  Serial.println("Servo commands: 'servo1 <angle>', 'servo2 <angle>', 'servoAll <angle>' (0-180)");
-  Serial.println("Motor commands: 'motor <speed>' (-255..255), 'motor brake', 'motor coast', 'motor stop'");
-  Serial.println("Alternate: 'motor reverse <speed>' or 'motor rev <speed>' to set reverse direction, or 'motor rev' to toggle direction at current speed");
+  
+  setupWebServer();
+  
+  // Start UDP beacon
+  udpBeacon.begin(UDP_BEACON_PORT);
+  Serial.println("[UDP] Beacon started on port 4210");
+  
+  Serial.println("\n=== System Ready ===");
+  Serial.println("Waiting for camera detection...");
+  Serial.println("Type 'start' to test manually\n");
 }
-
 
 void loop() {
-  // Check for an incoming line from USB Serial
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.length() > 0) {
-      Serial.print("Received USB command: '");
-      Serial.print(cmd);
-      Serial.println("'");
-      handleCommand(cmd);
+  server.handleClient();
+  
+  // Send beacon
+  if (WiFi.status() == WL_CONNECTED && millis() - lastBeaconTime >= beaconInterval) {
+    lastBeaconTime = millis();
+    sendDiscoveryBeacon();
+  }
+  
+  // Monitor WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Disconnected! Reconnecting...");
+    connectToWiFi();
+  }
+  
+  // Serial commands
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "start") {
+      processStartCommand();
+    } else if (command == "reset") {
+      Serial.println("[CMD] Resetting counter...");
+      startCounter = 0;
+      Serial.println("✓ Reset complete");
+    } else if (command == "status") {
+      Serial.println("\n=== System Status ===");
+      Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+      Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
+      Serial.printf("Start Counter: %d/3\n", startCounter);
+      Serial.println("====================\n");
     }
   }
+}
 
-  // (Bluetooth removed) commands may still come in via USB Serial
-
-  // Check for simple IPC messages from Camera over wired Serial1
-  if (Serial1.available()) {
-    String line = Serial1.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) {
-      Serial.print("IPC from Camera: '"); Serial.print(line); Serial.println("'");
-      // handle a few simple message types
-      if (line.indexOf("RAT") >= 0 || line.indexOf("TRIGGER") >= 0 || line.indexOf("detected") >= 0) {
-        // kick off the local process sequence
-        handleCommand("process");
-        // try to extract a confidence float if present in a JSON-like payload
-        float conf = 0.0;
-        int cidx = line.indexOf("confidence");
-        if (cidx >= 0) {
-          int colon = line.indexOf(':', cidx);
-          if (colon >= 0) {
-            String num = line.substring(colon + 1);
-            // strip non-digit trailing
-            int end = 0;
-            while (end < (int)num.length() && (isDigit(num[end]) || num[end]=='.')) end++;
-            num = num.substring(0, end);
-            conf = num.toFloat();
-          }
-        }
-        sendDetectionToFirestore("CameraESP32", conf);
-      }
-    }
+void processStartCommand() {
+  startCounter++;
+  Serial.printf("\n[START] Trigger received. Count: %d/3\n", startCounter);
+  
+  beepBuzzer(2, 100);
+  trapdoorMotion();
+  
+  if (startCounter >= 3) {
+    Serial.println("\n[TRIGGER] Counter reached 3!");
+    Serial.println("Activating CO2 and feed dispenser...");
+    
+    activateCO2();
+    dispenseFeed();
+    
+    startCounter = 0;
+    Serial.println("✓ Counter reset\n");
   }
+  
+  Serial.println("Ready for next trigger\n");
+}
 
-  // small delay to yield
-  delay(10);
+void trapdoorMotion() {
+  Serial.println("[TRAP] Opening trapdoor...");
+  motorForward(255);
+  delay(TRAPDOOR_OPEN_TIME);
+  motorStop();
+  delay(TRAPDOOR_STOP_PAUSE);
+  
+  Serial.println("[TRAP] Closing trapdoor...");
+  motorReverse(255);
+  delay(TRAPDOOR_CLOSE_TIME);
+  motorStop();
+  delay(TRAPDOOR_STOP_PAUSE);
+  
+  Serial.println("[TRAP] ✓ Complete");
+}
+
+void activateCO2() {
+  Serial.println("[CO2] Opening solenoid...");
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(CO2_RELAY_ON_TIME);
+  
+  Serial.println("[CO2] Closing solenoid...");
+  digitalWrite(RELAY_PIN, LOW);
+  delay(CO2_RELAY_OFF_PAUSE);
+  
+  Serial.println("[CO2] ✓ Complete");
+}
+
+void dispenseFeed() {
+  Serial.println("[FEED] Opening dispenser...");
+  servo1.write(90);
+  servo2.write(90);
+  delay(FEED_OPEN_TIME);
+  
+  Serial.println("[FEED] Closing dispenser...");
+  servo1.write(0);
+  servo2.write(0);
+  delay(FEED_CLOSE_TIME);
+  
+  Serial.println("[FEED] ✓ Complete");
+}
+
+void motorForward(int speed) {
+  ledcWrite(LPWM, 0);
+  ledcWrite(RPWM, speed);
+}
+
+void motorReverse(int speed) {
+  ledcWrite(RPWM, 0);
+  ledcWrite(LPWM, speed);
+}
+
+void motorStop() {
+  ledcWrite(RPWM, 0);
+  ledcWrite(LPWM, 0);
+}
+
+void connectToWiFi() {
+  Serial.println("\n=== WiFi Connection ===");
+  Serial.printf("SSID: '%s'\n", WIFI_SSID);
+  
+  WiFi.disconnect(true, true);
+  delay(500);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n\n✓ WiFi Connected!");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+    
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(RED_LED_PIN, LOW);
+  } else {
+    Serial.println("\n\n✗ WiFi Failed");
+    
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(RED_LED_PIN, HIGH);
+    
+    WiFi.disconnect(true, true);
+    delay(200);
+    WiFi.mode(WIFI_OFF);
+  }
+}
+
+void setupWebServer() {
+  server.on("/trigger", HTTP_POST, []() {
+    Serial.println("[HTTP] Trigger received from camera!");
+    processStartCommand();
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/plain", "ESP32 Main Controller - Rat Trap System");
+  });
+  
+  server.begin();
+  Serial.println("[HTTP] Server started on port 80");
+  Serial.println("====================================");
+  Serial.printf("MAIN ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.println("====================================");
+}
+
+void sendDiscoveryBeacon() {
+  IPAddress broadcastIP = WiFi.localIP();
+  broadcastIP[3] = 255;
+  
+  udpBeacon.beginPacket(broadcastIP, UDP_BEACON_PORT);
+  udpBeacon.print(BEACON_MSG);
+  udpBeacon.endPacket();
+}
+
+void beepBuzzer(int times, int duration) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(duration);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < times - 1) delay(duration);
+  }
 }
