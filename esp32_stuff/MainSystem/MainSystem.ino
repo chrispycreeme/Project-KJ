@@ -4,8 +4,8 @@
 #include <WebServer.h>
 
 // ===== HARDCODED CREDENTIALS - CHANGE THESE =====
-const char* WIFI_SSID = "ProjectKJ";
-const char* WIFI_PASSWORD = "projectkj";
+const char* WIFI_SSID = "YourWiFiSSID";
+const char* WIFI_PASSWORD = "YourWiFiPassword";
 // ===============================================
 
 // UDP Beacon
@@ -27,9 +27,8 @@ WebServer server(80);
 // Relay for CO2
 #define RELAY_PIN 16
 
-// Servos
-#define SERVO1_PIN 27
-#define SERVO2_PIN 26
+// Servo (feed dispenser)
+#define SERVO_PIN 27
 
 // LEDs
 #define GREEN_LED_PIN 12
@@ -44,8 +43,7 @@ WebServer server(80);
 #define PWM_CHANNEL_RPWM 0
 #define PWM_CHANNEL_LPWM 1
 
-Servo servo1;
-Servo servo2;
+Servo feedServo;
 
 int startCounter = 0;
 
@@ -86,13 +84,10 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
   
   ESP32PWM::allocateTimer(2);
-  servo1.setPeriodHertz(50);
-  servo1.attach(SERVO1_PIN, 500, 2400);
-  servo2.setPeriodHertz(50);
-  servo2.attach(SERVO2_PIN, 500, 2400);
+  feedServo.setPeriodHertz(50);
+  feedServo.attach(SERVO_PIN, 500, 2400);
   
-  servo1.write(0);
-  servo2.write(0);
+  feedServo.write(0);
   
   // Connect to WiFi
   Serial.println("\n[WiFi] Connecting...");
@@ -205,13 +200,11 @@ void activateCO2() {
 
 void dispenseFeed() {
   Serial.println("[FEED] Opening dispenser...");
-  servo1.write(90);
-  servo2.write(90);
+  feedServo.write(90);
   delay(FEED_OPEN_TIME);
   
   Serial.println("[FEED] Closing dispenser...");
-  servo1.write(0);
-  servo2.write(0);
+  feedServo.write(0);
   delay(FEED_CLOSE_TIME);
   
   Serial.println("[FEED] ✓ Complete");
