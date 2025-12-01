@@ -2,11 +2,21 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ===== HARDCODED CREDENTIALS - CHANGE THESE =====
 const char* WIFI_SSID = "ProjectKJ";
 const char* WIFI_PASSWORD = "projectkj";
+const char* FIREBASE_PROJECT_ID = "project-kj-ae694";
+const char* FIREBASE_API_KEY = "AIzaSyDrMR1B5WWZUcugFYYOtjZBsmGWhtL3O88";
 // ===============================================
+
+// Firestore configuration
+const char* firestoreHost = "firestore.googleapis.com";
+const int firestorePort = 443;
+String documentPath = "trap_controller/primary"; // Collection/Document
 
 // UDP Beacon
 WiFiUDP udpBeacon;
@@ -46,6 +56,16 @@ WebServer server(80);
 Servo feedServo;
 
 int startCounter = 0;
+bool activateTrap = false;
+bool co2Release = false;
+bool openFeedDispenser = false;
+int cyclesNeededForCO2 = 4;
+int cycleCompleted = 0;
+int ratDetectedCount = 0;
+
+// Firestore sync timing
+unsigned long lastFirestoreSync = 0;
+const unsigned long firestoreSyncInterval = 5000; // Sync every 5 seconds
 
 // Timing (milliseconds)
 unsigned long TRAPDOOR_OPEN_TIME   = 500;
@@ -105,8 +125,13 @@ void setup() {
   udpBeacon.begin(UDP_BEACON_PORT);
   Serial.println("[UDP] Beacon started on port 4210");
   
+  // Initialize Firestore document
+  Serial.println("\n[Firestore] Initializing document...");
+  initializeFirestoreDocument();
+  
   Serial.println("\n=== System Ready ===");
   Serial.println("Waiting for camera detection...");
+  Serial.println("Syncing with Firestore every 5 seconds");
   Serial.println("Type 'start' to test manually\n");
 }
 
@@ -117,6 +142,12 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && millis() - lastBeaconTime >= beaconInterval) {
     lastBeaconTime = millis();
     sendDiscoveryBeacon();
+  }
+  
+  // Sync with Firestore
+  if (WiFi.status() == WL_CONNECTED && millis() - lastFirestoreSync >= firestoreSyncInterval) {
+    lastFirestoreSync = millis();
+    syncWithFirestore();
   }
   
   // Monitor WiFi
@@ -136,6 +167,8 @@ void loop() {
     } else if (command == "reset") {
       Serial.println("[CMD] Resetting counter...");
       startCounter = 0;
+      cycleCompleted = 0;
+      updateFirestore();
       Serial.println("✓ Reset complete");
     } else if (command == "status") {
       Serial.println("\n=== System Status ===");
@@ -144,13 +177,19 @@ void loop() {
       Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
       Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
       Serial.printf("Start Counter: %d/3\n", startCounter);
+      Serial.printf("Cycle Completed: %d\n", cycleCompleted);
+      Serial.printf("Rats Detected: %d\n", ratDetectedCount);
       Serial.println("====================\n");
+    } else if (command == "fetch") {
+      Serial.println("[CMD] Fetching Firestore data...");
+      fetchFirestoreData();
     }
   }
 }
 
 void processStartCommand() {
   startCounter++;
+  ratDetectedCount++;
   Serial.printf("\n[START] Trigger received. Count: %d/3\n", startCounter);
   
   beepBuzzer(2, 100);
@@ -158,14 +197,25 @@ void processStartCommand() {
   
   if (startCounter >= 3) {
     Serial.println("\n[TRIGGER] Counter reached 3!");
-    Serial.println("Activating CO2 and feed dispenser...");
+    cycleCompleted++;
     
-    activateCO2();
-    dispenseFeed();
+    Serial.printf("Cycles completed: %d/%d\n", cycleCompleted, cyclesNeededForCO2);
+    
+    if (cycleCompleted >= cyclesNeededForCO2) {
+      Serial.println("Activating CO2 and feed dispenser...");
+      activateCO2();
+      dispenseFeed();
+      cycleCompleted = 0; // Reset cycle counter
+    } else {
+      Serial.println("Cycle complete, waiting for more detections...");
+    }
     
     startCounter = 0;
     Serial.println("✓ Counter reset\n");
   }
+  
+  // Update Firestore
+  updateFirestore();
   
   Serial.println("Ready for next trigger\n");
 }
@@ -298,4 +348,202 @@ void beepBuzzer(int times, int duration) {
     digitalWrite(BUZZER_PIN, LOW);
     if (i < times - 1) delay(duration);
   }
+}
+
+// ===== FIRESTORE FUNCTIONS =====
+
+void initializeFirestoreDocument() {
+  Serial.println("[Firestore] Creating/updating initial document...");
+  
+  // Create initial document structure
+  String jsonPayload = "{\"fields\":{";
+  jsonPayload += "\"activate_trap\":{\"booleanValue\":false},";
+  jsonPayload += "\"co2_release\":{\"booleanValue\":false},";
+  jsonPayload += "\"open_feed_dispenser\":{\"booleanValue\":false},";
+  jsonPayload += "\"cycle_completed\":{\"integerValue\":\"0\"},";
+  jsonPayload += "\"cycles_needed_for_co2_release\":{\"integerValue\":\"4\"},";
+  jsonPayload += "\"rat_detected_count\":{\"integerValue\":\"0\"},";
+  jsonPayload += "\"updated_at\":{\"timestampValue\":\"" + getCurrentTimestamp() + "\"}";
+  jsonPayload += "}}";
+  
+  if (sendFirestoreRequest("PATCH", jsonPayload)) {
+    Serial.println("[Firestore] ✓ Document initialized");
+  } else {
+    Serial.println("[Firestore] ✗ Failed to initialize");
+  }
+}
+
+void syncWithFirestore() {
+  // Fetch current state from Firestore
+  fetchFirestoreData();
+  
+  // Check if we need to activate trap based on Firestore flags
+  if (activateTrap) {
+    Serial.println("\n[Firestore] activate_trap flag detected!");
+    processStartCommand();
+    
+    // Reset the flag in Firestore
+    activateTrap = false;
+    String resetPayload = "{\"fields\":{\"activate_trap\":{\"booleanValue\":false}}}";
+    sendFirestoreRequest("PATCH", resetPayload);
+  }
+  
+  if (co2Release) {
+    Serial.println("\n[Firestore] co2_release flag detected!");
+    activateCO2();
+    
+    // Reset the flag
+    co2Release = false;
+    String resetPayload = "{\"fields\":{\"co2_release\":{\"booleanValue\":false}}}";
+    sendFirestoreRequest("PATCH", resetPayload);
+  }
+  
+  if (openFeedDispenser) {
+    Serial.println("\n[Firestore] open_feed_dispenser flag detected!");
+    dispenseFeed();
+    
+    // Reset the flag
+    openFeedDispenser = false;
+    String resetPayload = "{\"fields\":{\"open_feed_dispenser\":{\"booleanValue\":false}}}";
+    sendFirestoreRequest("PATCH", resetPayload);
+  }
+}
+
+void fetchFirestoreData() {
+  Serial.println("[Firestore] Fetching document...");
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+  
+  String url = "/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/" + documentPath;
+  
+  if (!client.connect(firestoreHost, firestorePort)) {
+    Serial.println("[Firestore] ✗ Connection failed");
+    return;
+  }
+  
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + firestoreHost + "\r\n" +
+               "Connection: close\r\n\r\n");
+  
+  // Wait for response
+  unsigned long timeout = millis();
+  while (client.connected() && !client.available() && millis() - timeout < 5000) {
+    delay(10);
+  }
+  
+  // Skip headers
+  while (client.available()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  
+  // Read JSON response
+  String response = "";
+  while (client.available()) {
+    response += client.readString();
+  }
+  client.stop();
+  
+  if (response.length() > 0) {
+    Serial.println("[Firestore] ✓ Data received");
+    parseFirestoreResponse(response);
+  } else {
+    Serial.println("[Firestore] ✗ No data received");
+  }
+}
+
+void parseFirestoreResponse(String json) {
+  // Parse the Firestore JSON response
+  // Looking for patterns like: "activate_trap":{"booleanValue":true}
+  
+  if (json.indexOf("\"activate_trap\"") > 0) {
+    int pos = json.indexOf("\"activate_trap\"");
+    String sub = json.substring(pos, pos + 100);
+    activateTrap = sub.indexOf("true") > 0;
+  }
+  
+  if (json.indexOf("\"co2_release\"") > 0) {
+    int pos = json.indexOf("\"co2_release\"");
+    String sub = json.substring(pos, pos + 100);
+    co2Release = sub.indexOf("true") > 0;
+  }
+  
+  if (json.indexOf("\"open_feed_dispenser\"") > 0) {
+    int pos = json.indexOf("\"open_feed_dispenser\"");
+    String sub = json.substring(pos, pos + 100);
+    openFeedDispenser = sub.indexOf("true") > 0;
+  }
+  
+  if (json.indexOf("\"cycles_needed_for_co2_release\"") > 0) {
+    int pos = json.indexOf("\"cycles_needed_for_co2_release\"");
+    String sub = json.substring(pos, pos + 150);
+    int valPos = sub.indexOf("\"integerValue\":\"") + 16;
+    int endPos = sub.indexOf("\"", valPos);
+    if (valPos > 15 && endPos > valPos) {
+      String valStr = sub.substring(valPos, endPos);
+      cyclesNeededForCO2 = valStr.toInt();
+    }
+  }
+  
+  Serial.printf("[Firestore] Parsed - activate_trap: %d, co2: %d, feed: %d, cycles_needed: %d\n", 
+                activateTrap, co2Release, openFeedDispenser, cyclesNeededForCO2);
+}
+
+void updateFirestore() {
+  Serial.println("[Firestore] Updating document...");
+  
+  String jsonPayload = "{\"fields\":{";
+  jsonPayload += "\"cycle_completed\":{\"integerValue\":\"" + String(cycleCompleted) + "\"},";
+  jsonPayload += "\"rat_detected_count\":{\"integerValue\":\"" + String(ratDetectedCount) + "\"},";
+  jsonPayload += "\"updated_at\":{\"timestampValue\":\"" + getCurrentTimestamp() + "\"}";
+  jsonPayload += "}}";
+  
+  if (sendFirestoreRequest("PATCH", jsonPayload)) {
+    Serial.println("[Firestore] ✓ Document updated");
+  } else {
+    Serial.println("[Firestore] ✗ Update failed");
+  }
+}
+
+bool sendFirestoreRequest(String method, String jsonPayload) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+  
+  if (!client.connect(firestoreHost, firestorePort)) {
+    Serial.println("[Firestore] ✗ Connection failed");
+    return false;
+  }
+  
+  String url = "/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/" + documentPath;
+  
+  client.print(String(method) + " " + url + " HTTP/1.1\r\n" +
+               "Host: " + firestoreHost + "\r\n" +
+               "Content-Type: application/json\r\n" +
+               "Content-Length: " + String(jsonPayload.length()) + "\r\n" +
+               "Connection: close\r\n\r\n" +
+               jsonPayload);
+  
+  // Wait for response
+  unsigned long timeout = millis();
+  while (client.connected() && !client.available() && millis() - timeout < 5000) {
+    delay(10);
+  }
+  
+  bool success = false;
+  if (client.available()) {
+    String response = client.readStringUntil('\n');
+    success = response.indexOf("200") >= 0;
+  }
+  
+  client.stop();
+  return success;
+}
+
+String getCurrentTimestamp() {
+  // Return ISO 8601 timestamp
+  // For now, use a placeholder - in production, you'd use NTP to get real time
+  return "2025-01-01T00:00:00Z";
 }
