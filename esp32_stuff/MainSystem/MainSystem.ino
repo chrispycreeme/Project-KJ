@@ -4,8 +4,8 @@
 #include <WebServer.h>
 
 // ===== HARDCODED CREDENTIALS - CHANGE THESE =====
-const char* WIFI_SSID = "YourWiFiSSID";
-const char* WIFI_PASSWORD = "YourWiFiPassword";
+const char* WIFI_SSID = "ProjectKJ";
+const char* WIFI_PASSWORD = "projectkj";
 // ===============================================
 
 // UDP Beacon
